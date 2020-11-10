@@ -1,69 +1,105 @@
-import pandas as pd
-import numpy as np
-import argparse
 import os
-from peaks import *
 import traceback
+from os.path import basename, join
+
+import numpy as np
+import pandas as pd
+from neighborhoods import *
+from peaks import *
+from redun import Dir, File, task
 from tools import write_params
 
-def parseargs(required_args=True):
-    class formatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawTextHelpFormatter):
-        pass
+from insitro_core.utils.storage import *
 
-    epilog = ("")
-    parser = argparse.ArgumentParser(description='Make peaks file for a given cell type',
-                                     epilog=epilog,
-                                     formatter_class=formatter)
-    readable = argparse.FileType('r')
-    
-    parser.add_argument('--narrowPeak', required=required_args, help="narrowPeak file output by macs2. Must include summits (--call-summits)")
-    parser.add_argument('--bam', required=required_args, help="DNAase-Seq or ATAC-Seq bam file")
-    parser.add_argument('--chrom_sizes', required=required_args, help="File listing chromosome size annotaions")
-    parser.add_argument('--outDir', required=required_args)
-    
-    parser.add_argument('--nStrongestPeaks', default=175000, help="Number of peaks to use for defining candidate regions")
-    parser.add_argument('--peakExtendFromSummit', default=250, help="Number of base pairs to extend each preak from its summit (or from both ends of region if using --ignoreSummits)")
-    parser.add_argument('--ignoreSummits', action="store_true", help="Compute peaks using the full peak regions, rather than extending from summit.")
-    parser.add_argument('--minPeakWidth', default=500, help="Candidate regions whose width is below this threshold are expanded to this width. Only used with --ignoreSummits")
 
-    parser.add_argument('--regions_whitelist', default="", help="Bed file of regions to forcibly include in candidate enhancers. Overrides regions_blacklist")
-    parser.add_argument('--regions_blacklist', default="", help="Bed file of regions to forcibly exclude from candidate enhancers")
-    
-    args = parser.parse_args()
-    return(args)
+@task()
+def makeCandidateRegions(
+    narrowPeak: str,
+    input_bam: str,
+    output_dir: str,
+    chrom_sizes: str,
+    tmpdir: str,
+    regions_blacklist: str = None,
+    regions_whitelist: str = None,
+    peakExtendFromSummit: int = 250,
+    nStrongestPeaks: int = 175000,
+    ignoreSummits: bool = False,
+    minPeakWidth: int = 500,
+):
+    """
+    Inputs:
+    narrowPeak: narrowPeak file output by macs2. Must include summits (--call-summits)
+    input_bam: DNAase-Seq or atac-Seq input_bam file
+    chrom_sizes: File listing chromosome size annotations
+    output_dir: output folder where results will be stored; this is created if it doesn't exist
+    nStrongestPeaks: Number of peaks to use for defining candidate regions
+    peakExtendFromSummit: Number of base pairs to extend each preak from its summit (or from both ends of region if using --ignoreSummits)
+    ignoreSummits: Compute peaks using the full peak regions, rather than extending from summit.
+    minPeakWidth: Candidate regions whose width is below this threshold are expanded to this width. Only used with --ignoreSummits
+    regions_whitelist: Bed file of regions to forcibly include in candidate enhancers. Overrides regions_blacklist
+    regions_blacklist: Bed file of regions to forcibly exclude from candidate enhancers
+    """
+    # create output directory.
+    # if output directory is in s3, create local directory from it's basename to serve as workdir
+    makedirs(output_dir)
+    makedirs(tmpdir)
 
-def processCellType(args):
-    os.makedirs(os.path.join(args.outDir), exist_ok=True)
-    write_params(args, os.path.join(args.outDir, "params.txt"))
+    write_params(
+        {
+            "narrowPeak": narrowPeak,
+            "input_bam": input_bam,
+            "output_dir": output_dir,
+            "tmpdir": tmpdir,
+            "chrom_sizes": chrom_sizes,
+            "regions_blacklist": regions_blacklist,
+            "regions_whitelist": regions_whitelist,
+            "peakExtendFromSummit": peakExtendFromSummit,
+            "nStrongestPeaks": nStrongestPeaks,
+            "ignoreSummits": ignoreSummits,
+            "minPeakWidth": minPeakWidth,
+        },
+        output_dir,
+        tmpdir,
+        "parameters.txt",
+    )
+    # 1. Count dhs/atac reads in candidate regions
+    raw_counts_outfile = join(
+        output_dir, basename(narrowPeak) + "." + basename(input_bam) + ".Counts.bed"
+    )
 
-    #Make candidate regions
-    if not args.ignoreSummits:
-        make_candidate_regions_from_summits(macs_peaks = args.narrowPeak, 
-                                            accessibility_file = args.bam, 
-                                            genome_sizes = args.chrom_sizes, 
-                                            regions_whitelist = args.regions_whitelist,
-                                            regions_blacklist = args.regions_blacklist,
-                                            n_enhancers = args.nStrongestPeaks, 
-                                            peak_extend = args.peakExtendFromSummit, 
-                                            outdir = args.outDir)
+    run_count_reads_out = run_count_reads(
+        target=input_bam,
+        output=raw_counts_outfile,
+        output_dir=output_dir,
+        tmpdir=tmpdir,
+        bed_file=narrowPeak,
+        chrom_sizes=chrom_sizes,
+        use_fast_count=True,
+    )
+
+    # Make candidate regions
+    if not ignoreSummits:
+        return make_candidate_regions_from_summits(
+            count_file=run_count_reads_out["path"],
+            macs_peaks=narrowPeak,
+            chrom_sizes=chrom_sizes,
+            regions_whitelist=regions_whitelist,
+            regions_blacklist=regions_blacklist,
+            n_enhancers=nStrongestPeaks,
+            peak_extend=peakExtendFromSummit,
+            output_dir=output_dir,
+            tmpdir=tmpdir,
+        )
     else:
-        make_candidate_regions_from_peaks(macs_peaks = args.narrowPeak, 
-                                    accessibility_file = args.bam, 
-                                    genome_sizes = args.chrom_sizes, 
-                                    regions_whitelist = args.regions_whitelist,
-                                    regions_blacklist = args.regions_blacklist,
-                                    n_enhancers = args.nStrongestPeaks, 
-                                    peak_extend = args.peakExtendFromSummit, 
-                                    minPeakWidth = args.minPeakWidth,
-                                    outdir = args.outDir)
-
-def main(args):
-    processCellType(args)
-
-if __name__ == '__main__':
-    args = parseargs()
-    main(args)
-
-
-
-
+        return make_candidate_regions_from_peaks(
+            count_file=run_count_reads_out["path"],
+            macs_peaks=narrowPeak,
+            chrom_sizes=chrom_sizes,
+            regions_whitelist=regions_whitelist,
+            regions_blacklist=regions_blacklist,
+            n_enhancers=nStrongestPeaks,
+            peak_extend=peakExtendFromSummit,
+            minPeakWidth=minPeakWidth,
+            output_dir=output_dir,
+            tmpdir=tmpdir,
+        )

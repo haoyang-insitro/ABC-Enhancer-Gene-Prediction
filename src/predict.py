@@ -1,149 +1,285 @@
-import argparse
-from predictor import *
-from tools import *
-import pandas as pd
-import numpy as np
-import sys, traceback, os, os.path
+import pdb
+import sys
 import time
+import traceback
+from os.path import basename, join
 
-def get_model_argument_parser():
-    class formatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawTextHelpFormatter):
-        pass
+import numpy as np
+import pandas as pd
+from predictor import *
+from redun import Dir, File, script, task
+from tools import *
 
-    parser = argparse.ArgumentParser(description='Predict enhancer relative effects.',
-                                     formatter_class=formatter)
-    readable = argparse.FileType('r')
-
-    #Basic parameters
-    parser.add_argument('--enhancers', required=True, help="Candidate enhancer regions. Formatted as the EnhancerList.txt file produced by run.neighborhoods.py")
-    parser.add_argument('--genes', required=True, help="Genes to make predictions for. Formatted as the GeneList.txt file produced by run.neighborhoods.py")
-    parser.add_argument('--outdir', required=True, help="output directory")
-    parser.add_argument('--window', type=int, default=5000000, help="Make predictions for all candidate elements within this distance of the gene's TSS")
-    parser.add_argument('--score_column', default='ABC.Score', help="Column name of score to use for thresholding")
-    parser.add_argument('--threshold', type=float, required=True, default=.022, help="Threshold on ABC Score (--score_column) to call a predicted positive")
-    parser.add_argument('--cellType', help="Name of cell type")
-
-    #hic
-    #To do: validate params
-    parser.add_argument('--HiCdir', default=None, help="HiC directory")
-    parser.add_argument('--hic_resolution', type=int, help="HiC resolution")
-    parser.add_argument('--tss_hic_contribution', type=float, default=100, help="Weighting of diagonal bin of hic matrix as a percentage of the maximum of its neighboring bins")
-    parser.add_argument('--hic_pseudocount_distance', type=int, default=1e6, help="A pseudocount is added equal to the powerlaw fit at this distance")
-    parser.add_argument('--hic_type', default = 'juicebox', choices=['juicebox','bedpe'], help="format of hic files")
-    parser.add_argument('--hic_is_doubly_stochastic', action='store_true', help="If hic matrix is already DS, can skip this step")
-
-    #Power law
-    parser.add_argument('--scale_hic_using_powerlaw', action="store_true", help="Scale Hi-C values using powerlaw relationship")
-    parser.add_argument('--hic_gamma', type=float, default=.87, help="powerlaw exponent of hic data. Must be positive")
-    parser.add_argument('--hic_gamma_reference', type=float, default=.87, help="powerlaw exponent to scale to. Must be positive")
-
-    #Genes to run through model
-    parser.add_argument('--run_all_genes', action='store_true', help="Do not check for gene expression, make predictions for all genes")
-    parser.add_argument('--expression_cutoff', type=float, default=1, help="Make predictions for genes with expression higher than this value")
-    parser.add_argument('--promoter_activity_quantile_cutoff', type=float, default=.4, help="Quantile cutoff on promoter activity. Used to consider a gene 'expressed' in the absence of expression data")
-
-    #Output formatting
-    parser.add_argument('--make_all_putative', action="store_true", help="Make big file with concatenation of all genes file")
-    parser.add_argument('--use_hdf5', action="store_true", help="Write AllPutative file in hdf5 format instead of tab-delimited")
-
-    #Other
-    parser.add_argument('--tss_slop', type=int, default=500, help="Distance from tss to search for self-promoters")
-    parser.add_argument('--chromosomes', default="all", help="chromosomes to make predictions for. Defaults to intersection of all chromosomes in --genes and --enhancers")
-    parser.add_argument('--include_chrY', '-y', action='store_true', help="Make predictions on Y chromosome")
-
-    return parser
+from insitro_core.utils.cloud.bucket_utils import download_file
+from insitro_core.utils.storage import *
 
 
-def get_predict_argument_parser():
-    parser = get_model_argument_parser()
-    return parser
+@task()
+def predict(
+    output_dir: str,
+    tmpdir: str,
+    enhancers: str,
+    genes: str,
+    celltype: str,
+    hic_resolution: int,
+    window: int = 5e6,
+    score_column: str = "ABC.Score",
+    threshold: float = 0.022,
+    hicdir: str = None,
+    tss_hic_contribution: float = 100,
+    hic_pseudocount_distance: int = 1e6,
+    hic_type: str = "juicebox",
+    hic_is_doubly_stochastic: bool = False,
+    scale_hic_using_powerlaw: bool = False,
+    hic_gamma: float = 0.87,
+    hic_gamma_reference: float = 0.87,
+    run_all_genes: bool = False,
+    expression_cutoff: float = 1,
+    promoter_activity_quantile_cutoff: float = 0.4,
+    make_all_putative: bool = False,
+    use_hdf5: bool = False,
+    tss_slop: float = 500,
+    chromosomes: str = "all",
+    include_chrY: bool = True,
+):
+    """
+    #Default Params:
+    enhancers: Candidate enhancer regions. Formatted as the EnhancerList.txt file produced by run.neighborhoods.py
+    genes: Genes to make predictions for. Formatted as the GeneList.txt file produced by run.neighborhoods.py
+    celltype: Name of cell type.
+    window: Make predictions for all candidate elements within this distance of the gene's TSS.
+    score_column: Column name of score to use for thresholding.
+    threshold: Threshold on ABC Score (--score_column) to call a predicted positive
 
-def main():
-    parser = get_predict_argument_parser()
-    args = parser.parse_args()
+    #HiC params:
+    hicdir: HiC directory.
+    hic_resolution: HiC resolution.
+    tss_hic_contribution: Weighting of diagonal bin of hic matrix as a percentage of the maximum of its neighboring bins
+    hic_pseudocount_distance:A pseudocount is added equal to the powerlaw fit at this distance
+    hic_type:format of hic files; one of juicebox, bedpe
+    hich_is_doubly_stochastic: If hic matrix is already DS, can skip this step
 
-    validate_args(args)
+    #PowerLaw params:
+    scale_hic_using_powerlaw: Scale Hi-C values using powerlaw relationship
+    hic_gamma: Powerlaw exponent of hic data. Must be positive
+    run_all_genes: Do not check for gene expression, make predictions for all genes
+    expression_cutoff: Make predictions for genes with expression higher than this value
+    promoter_activity_quantile_cutoff: Quantile cutoff on promoter activity. Used to consider a gene 'expressed' in the absence of expression data
+    make_all_putative: Make big file with concatenation of all genes file
+    use_hdf5: Write AllPutative file in hdf5 format instead of tab-delimited
+    tss_slop: Distance from tss to search for self-promoters
+    chromosomes: Chromosomes to make predictions for. Defaults to intersection of all chromosomes in --genes and --enhancers
+    inlcude_chrY: Make predictions on Y chromosome
+    """
+    makedirs(output_dir)
+    makedirs(tmpdir)
 
-    if not os.path.exists(args.outdir):
-        os.makedirs(args.outdir)
+    # write the parameters
+    write_params(
+        {
+            "output_dir": output_dir,
+            "tmpdir": tmpdir,
+            "enhancers": enhancers,
+            "genes": genes,
+            "celltype": celltype,
+            "hic_resolution": hic_resolution,
+            "window": window,
+            "score_column": score_column,
+            "threshold": threshold,
+            "hicdir": hicdir,
+            "tss_hic_contribution": tss_hic_contribution,
+            "hic_pseudocount_distance": hic_pseudocount_distance,
+            "hic_type": hic_type,
+            "hic_is_doubly_stochastic": hic_is_doubly_stochastic,
+            "scale_hic_using_powerlaw": scale_hic_using_powerlaw,
+            "hic_gamma": hic_gamma,
+            "hic_gamma_reference": hic_gamma_reference,
+            "run_all_genes": run_all_genes,
+            "expression_cutoff": expression_cutoff,
+            "promoter_activity_quantile_cutoff": promoter_activity_quantile_cutoff,
+            "make_all_putative": make_all_putative,
+            "use_hdf5": use_hdf5,
+            "tss_slop": tss_slop,
+            "chromosomes": chromosomes,
+            "include_chrY": include_chrY,
+        },
+        output_dir=output_dir,
+        tmpdir=tmpdir,
+        output_fname="parameters.predict.txt",
+    )
 
-    write_params(args, os.path.join(args.outdir, "parameters.predict.txt"))
-    
-    print("reading genes")
-    genes = pd.read_csv(args.genes, sep = "\t")
-    genes = determine_expressed_genes(genes, args.expression_cutoff, args.promoter_activity_quantile_cutoff)
-    genes = genes.loc[:,['chr','symbol','tss','Expression','PromoterActivityQuantile','isExpressed']]
-    genes.columns = ['chr','TargetGene', 'TargetGeneTSS', 'TargetGeneExpression', 'TargetGenePromoterActivityQuantile','TargetGeneIsExpressed']
-       
+    if type(genes) == str:
+        print("reading genes")
+        genes = pd.read_csv(genes, sep="\t")
+    genes = determine_expressed_genes(
+        genes, expression_cutoff, promoter_activity_quantile_cutoff
+    )
+    genes = genes.loc[
+        :,
+        [
+            "chr",
+            "symbol",
+            "tss",
+            "Expression",
+            "PromoterActivityQuantile",
+            "isExpressed",
+        ],
+    ]
+    genes.columns = [
+        "chr",
+        "TargetGene",
+        "TargetGeneTSS",
+        "TargetGeneExpression",
+        "TargetGenePromoterActivityQuantile",
+        "TargetGeneIsExpressed",
+    ]
+
     print("reading enhancers")
-    enhancers_full = pd.read_csv(args.enhancers, sep = "\t")
-    #TO DO
-    #Think about which columns to include
-    enhancers = enhancers_full.loc[:,['chr','start','end','name','class','activity_base']]
+    enhancers_full = pd.read_csv(enhancers, sep="\t")
+    # TO DO
+    # Think about which columns to include
+    enhancers = enhancers_full.loc[
+        :, ["chr", "start", "end", "name", "class", "activity_base"]
+    ]
 
-    #Initialize Prediction files
-    pred_file_full = os.path.join(args.outdir, "EnhancerPredictionsFull.txt")
-    pred_file_slim = os.path.join(args.outdir, "EnhancerPredictions.txt")
-    pred_file_bedpe = os.path.join(args.outdir, "EnhancerPredictions.bedpe")
-    all_pred_file_expressed = os.path.join(args.outdir, "EnhancerPredictionsAllPutative.txt.gz")
-    all_pred_file_nonexpressed = os.path.join(args.outdir, "EnhancerPredictionsAllPutativeNonExpressedGenes.txt.gz")
+    # Initialize Prediction files
+    pred_file_full = join(tmpdir, "EnhancerPredictionsFull.txt")
+    pred_file_slim = join(tmpdir, "EnhancerPredictions.txt")
+    pred_file_bedpe = join(tmpdir, "EnhancerPredictions.bedpe")
+    all_pred_file_expressed = join(tmpdir, "EnhancerPredictionsAllPutative.txt.gz")
+    all_pred_file_nonexpressed = join(
+        tmpdir, "EnhancerPredictionsAllPutativeNonExpressedGenes.txt.gz"
+    )
     all_putative_list = []
 
-    #Make predictions
-    if args.chromosomes == "all":
-        chromosomes = set(genes['chr']).intersection(set(enhancers['chr'])) 
-        if not args.include_chrY:
-            chromosomes.discard('chrY')
+    # Make predictions
+    if chromosomes == "all":
+        chromosomes = set(genes["chr"]).intersection(set(enhancers["chr"]))
+        if not include_chrY:
+            chromosomes.discard("chrY")
     else:
-        chromosomes = args.chromosomes.split(",")
+        chromosomes = chromosomes.split(",")
 
     for chromosome in chromosomes:
-        print('Making predictions for chromosome: {}'.format(chromosome))
+        print("Making predictions for chromosome: {}".format(chromosome))
         t = time.time()
 
-        this_enh = enhancers.loc[enhancers['chr'] == chromosome, :].copy()
-        this_genes = genes.loc[genes['chr'] == chromosome, :].copy()
+        this_enh = enhancers.loc[enhancers["chr"] == chromosome, :].copy()
+        this_genes = genes.loc[genes["chr"] == chromosome, :].copy()
 
-        this_chr = make_predictions(chromosome, this_enh, this_genes, args)
+        this_chr = make_predictions(
+            tmpdir,
+            chromosome,
+            this_enh,
+            this_genes,
+            window,
+            tss_slop,
+            hic_type,
+            hicdir,
+            hic_gamma,
+            hic_gamma_reference,
+            hic_resolution,
+            tss_hic_contribution,
+            scale_hic_using_powerlaw,
+            hic_pseudocount_distance,
+        )
         all_putative_list.append(this_chr)
 
-        print('Completed chromosome: {}. Elapsed time: {} \n'.format(chromosome, time.time() - t))
+        print(
+            "Completed chromosome: {}. Elapsed time: {} \n".format(
+                chromosome, time.time() - t
+            )
+        )
 
     # Subset predictions
     print("Writing output files...")
     all_putative = pd.concat(all_putative_list)
-    all_putative['CellType'] = args.cellType
-    slim_cols = ['chr','start','end','name','TargetGene','TargetGeneTSS','CellType',args.score_column]
-    if args.run_all_genes:
-        all_positive = all_putative.iloc[np.logical_and.reduce((all_putative[args.score_column] > args.threshold, ~(all_putative['class'] == "promoter"))),:]
+    all_putative["CellType"] = celltype
+    slim_cols = [
+        "chr",
+        "start",
+        "end",
+        "name",
+        "TargetGene",
+        "TargetGeneTSS",
+        "CellType",
+        score_column,
+    ]
+    if run_all_genes:
+        all_positive = all_putative.iloc[
+            np.logical_and.reduce(
+                (
+                    all_putative[score_column] > threshold,
+                    ~(all_putative["class"] == "promoter"),
+                )
+            ),
+            :,
+        ]
     else:
-        all_positive = all_putative.iloc[np.logical_and.reduce((all_putative.TargetGeneIsExpressed, all_putative[args.score_column] > args.threshold, ~(all_putative['class'] == "promoter"))),:]
+        all_positive = all_putative.iloc[
+            np.logical_and.reduce(
+                (
+                    all_putative.TargetGeneIsExpressed,
+                    all_putative[score_column] > threshold,
+                    ~(all_putative["class"] == "promoter"),
+                )
+            ),
+            :,
+        ]
 
-    all_positive.to_csv(pred_file_full, sep="\t", index=False, header=True, float_format="%.6f")
-    all_positive[slim_cols].to_csv(pred_file_slim, sep="\t", index=False, header=True, float_format="%.6f")
+    all_positive.to_csv(
+        pred_file_full, sep="\t", index=False, header=True, float_format="%.6f"
+    )
+    all_positive[slim_cols].to_csv(
+        pred_file_slim, sep="\t", index=False, header=True, float_format="%.6f"
+    )
 
-    make_gene_prediction_stats(all_putative, args)
-    write_connections_bedpe_format(all_positive, pred_file_bedpe, args.score_column)
+    make_gene_prediction_stats(all_putative, score_column, threshold, tmpdir)
+    write_connections_bedpe_format(all_positive, pred_file_bedpe, score_column)
 
-    if args.make_all_putative:
-        if not args.use_hdf5:
-            all_putative.loc[all_putative.TargetGeneIsExpressed,:].to_csv(all_pred_file_expressed, sep="\t", index=False, header=True, compression="gzip", float_format="%.6f", na_rep="NaN")
-            all_putative.loc[~all_putative.TargetGeneIsExpressed,:].to_csv(all_pred_file_nonexpressed, sep="\t", index=False, header=True, compression="gzip", float_format="%.6f", na_rep="NaN")
+    if make_all_putative:
+        if not use_hdf5:
+            all_putative.loc[all_putative.TargetGeneIsExpressed, :].to_csv(
+                all_pred_file_expressed,
+                sep="\t",
+                index=False,
+                header=True,
+                compression="gzip",
+                float_format="%.6f",
+                na_rep="NaN",
+            )
+            all_putative.loc[~all_putative.TargetGeneIsExpressed, :].to_csv(
+                all_pred_file_nonexpressed,
+                sep="\t",
+                index=False,
+                header=True,
+                compression="gzip",
+                float_format="%.6f",
+                na_rep="NaN",
+            )
         else:
-            all_pred_file_expressed = os.path.join(args.outdir, "EnhancerPredictionsAllPutative.h5")
-            all_pred_file_nonexpressed = os.path.join(args.outdir, "EnhancerPredictionsAllPutativeNonExpressedGenes.h5")
-            all_putative.loc[all_putative.TargetGeneIsExpressed,:].to_hdf(all_pred_file_expressed, key='predictions', complevel=9, mode='w')
-            all_putative.loc[~all_putative.TargetGeneIsExpressed,:].to_hdf(all_pred_file_nonexpressed, key='predictions', complevel=9, mode='w')
-            
+            all_pred_file_expressed = join(tmpdir, "EnhancerPredictionsAllPutative.h5")
+            all_pred_file_nonexpressed = join(
+                tmpdir, "EnhancerPredictionsAllPutativeNonExpressedGenes.h5"
+            )
+            all_putative.loc[all_putative.TargetGeneIsExpressed, :].to_hdf(
+                all_pred_file_expressed, key="predictions", complevel=9, mode="w"
+            )
+            all_putative.loc[~all_putative.TargetGeneIsExpressed, :].to_hdf(
+                all_pred_file_nonexpressed, key="predictions", complevel=9, mode="w"
+            )
+
+    # copy local files to remote
+    upload_file(pred_file_full, output_dir, overwrite_ok=True)
+    upload_file(pred_file_slim, output_dir, overwrite_ok=True)
+    upload_file(pred_file_bedpe, output_dir, overwrite_ok=True)
+    upload_file(all_pred_file_expressed, output_dir, overwrite_ok=True)
+    upload_file(all_pred_file_nonexpressed, output_dir, overwrite_ok=True)
     print("Done.")
-    
-def validate_args(args):
-    if args.HiCdir and args.hic_type == 'juicebox':
-        assert args.hic_resolution is not None, 'HiC resolution must be provided if hic_type is juicebox'
-
-    if not args.HiCdir:
-        print("WARNING: Hi-C directory not provided. Model will only compute ABC score using powerlaw!")
-
-if __name__ == '__main__':
-    main()
-    
+    return [
+        pred_file_full,
+        pred_file_slim,
+        pred_file_bedpe,
+        all_pred_file_expressed,
+        all_pred_file_nonexpressed,
+    ]
